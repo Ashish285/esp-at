@@ -28,6 +28,8 @@
 #include "freertos/task.h"
 #include "esp_system.h"
 #include "nvs_flash.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
 
 #ifdef CONFIG_AT_WIFI_COMMAND_SUPPORT
 #include "esp_event.h"
@@ -55,6 +57,55 @@ extern void at_web_update_sta_got_ip_flag(bool flag);
 
 #ifdef CONFIG_IDF_TARGET_ESP32
 #include "hal/wdt_hal.h"
+
+#define PIN_PHY_POWER 12
+const char* TAG = "ETHERNET";
+#ifdef CONFIG_AT_ETHERNET_SUPPORT
+/** Event handler for Ethernet events */
+static void eth_event_handler(void *arg, esp_event_base_t event_base,
+                              int32_t event_id, void *event_data)
+{
+    uint8_t mac_addr[6] = {0};
+    /* we can get the ethernet driver handle from event data */
+    esp_eth_handle_t eth_handle = *(esp_eth_handle_t *)event_data;
+
+    switch (event_id) {
+    case ETHERNET_EVENT_CONNECTED:
+        esp_eth_ioctl(eth_handle, ETH_CMD_G_MAC_ADDR, mac_addr);
+        ESP_LOGI(TAG, "Ethernet Link Up");
+        ESP_LOGI(TAG, "Ethernet HW Addr %02x:%02x:%02x:%02x:%02x:%02x",
+                 mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+        break;
+    case ETHERNET_EVENT_DISCONNECTED:
+        ESP_LOGI(TAG, "Ethernet Link Down");
+        break;
+    case ETHERNET_EVENT_START:
+        ESP_LOGI(TAG, "Ethernet Started");
+        break;
+    case ETHERNET_EVENT_STOP:
+        ESP_LOGI(TAG, "Ethernet Stopped");
+        break;
+    default:
+        break;
+    }
+}
+
+/** Event handler for IP_EVENT_ETH_GOT_IP */
+static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
+                                 int32_t event_id, void *event_data)
+{
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
+    const esp_netif_ip_info_t *ip_info = &event->ip_info;
+
+    ESP_LOGI(TAG, "Ethernet Got IP Address");
+    ESP_LOGI(TAG, "~~~~~~~~~~~");
+    ESP_LOGI(TAG, "ETHIP:" IPSTR, IP2STR(&ip_info->ip));
+    ESP_LOGI(TAG, "ETHMASK:" IPSTR, IP2STR(&ip_info->netmask));
+    ESP_LOGI(TAG, "ETHGW:" IPSTR, IP2STR(&ip_info->gw));
+    ESP_LOGI(TAG, "~~~~~~~~~~~");
+}
+#endif
+
 static void at_disable_rtc_wdt(void)
 {
     /*
@@ -81,6 +132,39 @@ static esp_err_t at_wifi_event_handler(void *ctx, system_event_t *event)
     esp_err_t ret = esp_at_wifi_event_handler(ctx, event);
 
     return ret;
+}
+
+static void at_netif_init(void)
+{
+    ESP_ERROR_CHECK(esp_netif_init());
+
+#ifdef CONFIG_AT_WIFI_COMMAND_SUPPORT
+    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
+#endif
+
+#ifdef CONFIG_AT_ETHERNET_SUPPORT
+    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
+    esp_netif_t *eth_netif = esp_netif_new(&cfg);
+    ESP_ERROR_CHECK(esp_eth_set_default_handlers(eth_netif));
+    ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, &eth_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
+    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
+    eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
+    gpio_pad_select_gpio(PIN_PHY_POWER);
+    gpio_set_direction(PIN_PHY_POWER,GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_PHY_POWER, 1);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&mac_config);
+    esp_eth_phy_t *phy = esp_eth_phy_new_lan8720(&phy_config);
+    esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
+    esp_eth_handle_t eth_handle = NULL;
+    ESP_ERROR_CHECK(esp_eth_driver_install(&config, &eth_handle));
+    /* attach Ethernet driver to TCP/IP stack */
+    ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle)));
+    /* start Ethernet driver state machine */
+    ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+#endif
 }
 
 static void initialise_wifi(void)
@@ -115,13 +199,20 @@ void app_main()
      */
     at_disable_rtc_wdt();
 #endif
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    // gpio_pad_select_gpio(PIN_PHY_POWER);
+    // gpio_set_direction(PIN_PHY_POWER,GPIO_MODE_OUTPUT);
+    // gpio_set_level(PIN_PHY_POWER, 1);
+    // vTaskDelay(pdMS_TO_TICKS(10));
+
+    at_netif_init();
     uint8_t *version = (uint8_t *)malloc(256);
 #ifdef CONFIG_AT_COMMAND_TERMINATOR
     uint8_t cmd_terminator[2] = {CONFIG_AT_COMMAND_TERMINATOR,0};
 #endif
 
-    nvs_flash_init();
 // A workaround to avoid compilation warning (deprecated API: tcpip_adapter_init)
 // TODO: esp-at should remove it after v2.2.0.0
 #pragma GCC diagnostic push
